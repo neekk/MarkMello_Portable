@@ -689,6 +689,7 @@ public sealed class MarkdownDocumentView : UserControl
             MarkdownCodeBlock code => BuildCodeBlock(code, path),
             MarkdownTableBlock table => BuildTable(table, path),
             MarkdownImageBlock image => BuildImageBlock(image),
+            MarkdownDiagramBlock diagram => BuildDiagramBlock(diagram),
             _ => BuildFallback(block)
         };
 
@@ -705,6 +706,9 @@ public sealed class MarkdownDocumentView : UserControl
 
         _sourceLineAnchors.Add(new MarkdownSourceLineVisualAnchor(control, sourceSpan));
     }
+
+    private static MarkdownDiagramBlockView BuildDiagramBlock(MarkdownDiagramBlock block)
+        => new(block);
 
     private MarkdownImageView BuildImageBlock(MarkdownImageBlock block)
         => new(
