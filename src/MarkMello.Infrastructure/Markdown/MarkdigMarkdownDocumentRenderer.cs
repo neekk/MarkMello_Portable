@@ -7,6 +7,7 @@ using Markdig.Extensions.Tables;
 using Markdig.Syntax;
 using Markdig.Syntax.Inlines;
 using MarkMello.Application.Abstractions;
+using MarkMello.Application.Diagrams;
 using MarkMello.Domain;
 using CodeBlock = Markdig.Syntax.CodeBlock;
 
@@ -89,9 +90,7 @@ public sealed class MarkdigMarkdownDocumentRenderer : IMarkdownDocumentRenderer
 
             case FencedCodeBlock fencedCode:
                 target.Add(WithSourceSpan(
-                    new MarkdownCodeBlock(
-                        NormalizeNullable(fencedCode.Info?.ToString()),
-                        ExtractCode(fencedCode)),
+                    ConvertFencedCodeBlock(fencedCode),
                     fencedCode));
                 return;
 
@@ -332,6 +331,29 @@ public sealed class MarkdigMarkdownDocumentRenderer : IMarkdownDocumentRenderer
     {
         var text = codeBlock.Lines.ToString();
         return text.Replace("\r\n", "\n", StringComparison.Ordinal).TrimEnd('\n');
+    }
+
+    private static MarkdownBlock ConvertFencedCodeBlock(FencedCodeBlock fencedCode)
+    {
+        // Markdig already splits the info line: Info is the first token
+        // (the language/dialect), Arguments is the trimmed remainder.
+        var token = NormalizeNullable(fencedCode.Info?.ToString());
+        var arguments = NormalizeNullable(fencedCode.Arguments?.ToString());
+        var code = ExtractCode(fencedCode);
+
+        if (SupportedDiagramDialects.TryParseFenceToken(token, out var kind))
+        {
+            return new MarkdownDiagramBlock(kind, code, arguments);
+        }
+
+        // Preserve the legacy code-block info shape: keep dialect token plus
+        // arguments together so existing code-block consumers don't lose the
+        // remainder of an unknown info line.
+        var legacyInfo = arguments is null
+            ? token
+            : token is null ? arguments : $"{token} {arguments}";
+
+        return new MarkdownCodeBlock(legacyInfo, code);
     }
 
     private static string ExtractLeafText(LeafBlock block)
