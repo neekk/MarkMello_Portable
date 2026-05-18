@@ -1,4 +1,5 @@
 using System.ComponentModel;
+using System.Runtime.InteropServices;
 using Avalonia;
 using Avalonia.Controls;
 using Avalonia.Controls.ApplicationLifetimes;
@@ -24,7 +25,12 @@ public partial class MainWindow : Window
     private readonly StartupSmokeTestOptions _startupSmokeTestOptions = StartupSmokeTestOptions.Disabled;
     private readonly ISettingsStore? _settings;
     private readonly Task _startupInitializationTask = Task.CompletedTask;
+    private Win32Properties.CustomWndProcHookCallback? _windowsWndProcHookCallback;
+    private WindowsMonitorArea? _windowsMaximizeMonitorArea;
     private WindowPlacement? _lastNormalWindowPlacement;
+    private bool _isWindowsManualMaximized;
+    private bool _isConvertingWindowsNativeMaximize;
+    private bool _pendingWindowsStartupMaximize;
     private bool _allowConfirmedClose;
 
     public MainWindow()
@@ -50,6 +56,7 @@ public partial class MainWindow : Window
         InitializeComponent();
         ApplyStartupWindowPlacement();
         SyncOverlayWindowClasses();
+        UpdateTitleBarMaximizeVisuals();
 
         AddHandler(DragDrop.DragEnterEvent, OnDragEnter);
         AddHandler(DragDrop.DragOverEvent, OnDragOver);
@@ -62,6 +69,7 @@ public partial class MainWindow : Window
         Closing += OnWindowClosing;
         SizeChanged += OnWindowSizeChanged;
         PositionChanged += OnWindowPositionChanged;
+        PropertyChanged += OnWindowAvaloniaPropertyChanged;
         _viewModel.PropertyChanged += OnViewModelPropertyChanged;
         _viewModel.CloseRequested += OnViewModelCloseRequested;
 
@@ -69,12 +77,12 @@ public partial class MainWindow : Window
     }
 
     /// <summary>
-    /// Платформенные правила для Avalonia 12:
-    /// - Windows: extended client area + BorderOnly, чтобы оставить resize border
-    ///   и отрисовывать собственную title bar область из XAML.
-    /// - macOS: сохраняем системные decorations, но расширяем client area под наш layout.
-    ///   BorderOnly/None в 12.0.x для macOS пока проблемны по drag behavior.
-    /// - Linux: native chrome (вариативность WM, не лезем).
+    /// Platform chrome rules for Avalonia 12:
+    /// - Windows: extended client area + BorderOnly keeps the native resize border
+    ///   while the XAML layout draws the custom title bar.
+    /// - macOS: keep native decorations, but extend the client area under our layout.
+    ///   BorderOnly/None still have problematic drag behaviour in 12.0.x.
+    /// - Linux: keep native chrome because window manager behaviour varies widely.
     /// </summary>
     private void ConfigurePlatformChrome()
     {
@@ -83,6 +91,8 @@ public partial class MainWindow : Window
             ExtendClientAreaToDecorationsHint = true;
             ExtendClientAreaTitleBarHeightHint = 36;
             WindowDecorations = global::Avalonia.Controls.WindowDecorations.BorderOnly;
+            _windowsWndProcHookCallback = OnWindowsWndProc;
+            Win32Properties.AddWndProcHookCallback(this, _windowsWndProcHookCallback);
         }
         else if (OperatingSystem.IsMacOS())
         {
@@ -90,11 +100,12 @@ public partial class MainWindow : Window
             ExtendClientAreaTitleBarHeightHint = 36;
             WindowDecorations = global::Avalonia.Controls.WindowDecorations.Full;
         }
-        // Linux: ничего не переопределяем — пусть WM рисует свой chrome.
+        // Linux: let the window manager draw its native chrome.
     }
 
     private async void OnWindowOpened(object? sender, EventArgs e)
     {
+        ApplyPendingWindowsStartupMaximize();
         await _startupInitializationTask.ConfigureAwait(true);
         await CompleteStartupSmokeTestAsync().ConfigureAwait(true);
     }
@@ -112,8 +123,8 @@ public partial class MainWindow : Window
         }
         catch
         {
-            // Защита fast path: VM init не должна валить окно.
-            // Реальный logging придёт вместе с infrastructure logging в M4+.
+            // Keep the fast path resilient: VM initialization should not crash the window.
+            // Real logging belongs with the infrastructure logging work in M4+.
         }
     }
 
@@ -160,9 +171,16 @@ public partial class MainWindow : Window
 
     protected override void OnClosed(EventArgs e)
     {
+        if (_windowsWndProcHookCallback is not null)
+        {
+            Win32Properties.RemoveWndProcHookCallback(this, _windowsWndProcHookCallback);
+            _windowsWndProcHookCallback = null;
+        }
+
         Closing -= OnWindowClosing;
         SizeChanged -= OnWindowSizeChanged;
         PositionChanged -= OnWindowPositionChanged;
+        PropertyChanged -= OnWindowAvaloniaPropertyChanged;
         _viewModel.PropertyChanged -= OnViewModelPropertyChanged;
         _viewModel.CloseRequested -= OnViewModelCloseRequested;
         base.OnClosed(e);
@@ -174,9 +192,7 @@ public partial class MainWindow : Window
         => WindowState = WindowState.Minimized;
 
     private void OnMaximizeClick(object? sender, RoutedEventArgs e)
-        => WindowState = WindowState == WindowState.Maximized
-            ? WindowState.Normal
-            : WindowState.Maximized;
+        => ToggleWindowMaximize();
 
     private void OnCloseClick(object? sender, RoutedEventArgs e) => Close();
 
@@ -198,9 +214,7 @@ public partial class MainWindow : Window
         {
             if (CanResize)
             {
-                WindowState = WindowState == WindowState.Maximized
-                    ? WindowState.Normal
-                    : WindowState.Maximized;
+                ToggleWindowMaximize();
             }
 
             e.Handled = true;
@@ -214,12 +228,22 @@ public partial class MainWindow : Window
 
         try
         {
+            CaptureWindowsNativeMaximizeMonitorArea();
+            TryCaptureWindowsSnappedMaximize();
+            if ((_isWindowsManualMaximized || WindowState == WindowState.Maximized)
+                && RestoreWindowsManualMaximizeForDrag())
+            {
+                BeginMoveDrag(e);
+                e.Handled = true;
+                return;
+            }
+
             BeginMoveDrag(e);
             e.Handled = true;
         }
         catch
         {
-            // На неподдерживаемых платформах/состояниях окно просто не начнёт drag.
+            // Unsupported platforms or transient states simply do not start a drag.
         }
     }
 
@@ -301,7 +325,7 @@ public partial class MainWindow : Window
         }
         catch
         {
-            // VM сама конвертирует ошибки в LoadError state.
+            // The VM converts failures into the LoadError state.
         }
     }
 
@@ -354,6 +378,12 @@ public partial class MainWindow : Window
         {
             UpdateReadingProgressBarWidth();
         }
+
+        if (e.PropertyName is nameof(MainWindowViewModel.TitleBarMaximize)
+            or nameof(MainWindowViewModel.TitleBarRestore))
+        {
+            UpdateTitleBarMaximizeVisuals();
+        }
     }
 
     private static bool IsWithinVisual(Visual source, Visual target)
@@ -369,17 +399,679 @@ public partial class MainWindow : Window
         return false;
     }
 
+    private void UpdateTitleBarMaximizeVisuals()
+    {
+        var isRestoreState = _isWindowsManualMaximized || WindowState == WindowState.Maximized;
+
+        if (this.FindControl<Control>("TitleBarMaximizeIcon") is { } maximizeIcon)
+        {
+            maximizeIcon.IsVisible = !isRestoreState;
+        }
+
+        if (this.FindControl<Control>("TitleBarRestoreIcon") is { } restoreIcon)
+        {
+            restoreIcon.IsVisible = isRestoreState;
+        }
+
+        if (this.FindControl<Button>("TitleBarMaximizeButton") is { } button)
+        {
+            ToolTip.SetTip(
+                button,
+                isRestoreState
+                    ? _viewModel.TitleBarRestore
+                    : _viewModel.TitleBarMaximize);
+        }
+    }
+
+    // Windows custom chrome has two maximize paths. The title-bar button uses
+    // SetWindowPos directly so the window stays on the monitor it already
+    // occupies. WM_GETMINMAXINFO remains for native maximize requests such as
+    // double-click and Aero Snap, where Windows asks for monitor-relative bounds.
+    private IntPtr OnWindowsWndProc(
+        IntPtr hWnd,
+        uint msg,
+        IntPtr wParam,
+        IntPtr lParam,
+        ref bool handled)
+    {
+        if (msg != WindowsMessages.WmGetMinMaxInfo || lParam == IntPtr.Zero)
+        {
+            return IntPtr.Zero;
+        }
+
+        if (TryApplyWindowsMonitorMaximizeBounds(hWnd, lParam))
+        {
+            handled = true;
+        }
+
+        return IntPtr.Zero;
+    }
+
+    private bool TryApplyWindowsMonitorMaximizeBounds(IntPtr hWnd, IntPtr minMaxInfoPointer)
+    {
+        var monitorArea = _windowsMaximizeMonitorArea
+            ?? TryCreateWindowsMonitorAreaFromWindowBounds(hWnd)
+            ?? TryCreateWindowsMonitorAreaFromHandle(hWnd)
+            ?? TryCreateWindowsMonitorAreaFromCursor();
+        if (monitorArea is null || !monitorArea.Value.IsValid)
+        {
+            return false;
+        }
+
+        var maximizeBounds = CalculateWindowsMonitorMaximizeBounds(
+            monitorArea.Value.MonitorBounds,
+            monitorArea.Value.WorkingArea,
+            monitorArea.Value.Scaling,
+            MinWidth,
+            MinHeight);
+
+        var minMaxInfo = Marshal.PtrToStructure<MINMAXINFO>(minMaxInfoPointer);
+        minMaxInfo.ptMaxPosition.X = maximizeBounds.MaxPositionX;
+        minMaxInfo.ptMaxPosition.Y = maximizeBounds.MaxPositionY;
+        minMaxInfo.ptMaxSize.X = maximizeBounds.MaxSizeWidth;
+        minMaxInfo.ptMaxSize.Y = maximizeBounds.MaxSizeHeight;
+        minMaxInfo.ptMinTrackSize.X = Math.Max(minMaxInfo.ptMinTrackSize.X, maximizeBounds.MinTrackWidth);
+        minMaxInfo.ptMinTrackSize.Y = Math.Max(minMaxInfo.ptMinTrackSize.Y, maximizeBounds.MinTrackHeight);
+        Marshal.StructureToPtr(minMaxInfo, minMaxInfoPointer, fDeleteOld: false);
+        return true;
+    }
+
+    private void ToggleWindowMaximize()
+    {
+        if (_isWindowsManualMaximized)
+        {
+            RestoreWindowsManualMaximize();
+            return;
+        }
+
+        if (WindowState == WindowState.Maximized)
+        {
+            RestoreWindowsNormalChrome(TryGetWindowsHandle());
+            WindowState = WindowState.Normal;
+            return;
+        }
+
+        CaptureLastNormalWindowPlacement();
+        if (TryMaximizeWindowToCurrentWindowsMonitor())
+        {
+            return;
+        }
+
+        WindowState = WindowState.Maximized;
+    }
+
+    private bool TryMaximizeWindowToCurrentWindowsMonitor()
+    {
+        if (!OperatingSystem.IsWindows())
+        {
+            return false;
+        }
+
+        var handle = TryGetWindowsHandle();
+        var monitorArea = TryCreateWindowsMonitorAreaFromWindowBounds(handle)
+            ?? TryCreateWindowsMonitorAreaFromHandle(handle);
+        if (monitorArea is null || !monitorArea.Value.IsValid)
+        {
+            return false;
+        }
+
+        return TryApplyWindowsManualMaximize(monitorArea.Value);
+    }
+
+    private bool TryApplyWindowsManualMaximize(WindowsMonitorArea monitorArea)
+    {
+        var handle = TryGetWindowsHandle();
+        if (handle == IntPtr.Zero)
+        {
+            return false;
+        }
+
+        _windowsMaximizeMonitorArea = monitorArea;
+        _isWindowsManualMaximized = true;
+        var targetBounds = monitorArea.WorkingArea;
+        ApplyWindowsManualMaximizeChrome(handle);
+        if (!SetWindowPos(
+                handle,
+                IntPtr.Zero,
+                targetBounds.X,
+                targetBounds.Y,
+                targetBounds.Width,
+                targetBounds.Height,
+                WindowsMessages.SwpNoZOrder | WindowsMessages.SwpNoOwnerZOrder | WindowsMessages.SwpFrameChanged))
+        {
+            _windowsMaximizeMonitorArea = null;
+            _isWindowsManualMaximized = false;
+            RestoreWindowsNormalChrome(handle);
+            UpdateTitleBarMaximizeVisuals();
+            return false;
+        }
+
+        UpdateTitleBarMaximizeVisuals();
+        UpdateReadingProgressBarWidth();
+        return true;
+    }
+
+    private void RestoreWindowsManualMaximize()
+    {
+        var placement = _lastNormalWindowPlacement;
+        if (placement is null)
+        {
+            _isWindowsManualMaximized = false;
+            _windowsMaximizeMonitorArea = null;
+            RestoreWindowsNormalChrome(TryGetWindowsHandle());
+            UpdateTitleBarMaximizeVisuals();
+            return;
+        }
+
+        var normalizedPlacement = placement with { IsMaximized = false };
+        RestoreWindowsNormalChrome(TryGetWindowsHandle());
+        WindowState = WindowState.Normal;
+        Width = Math.Max(MinWidth, normalizedPlacement.Width);
+        Height = Math.Max(MinHeight, normalizedPlacement.Height);
+        Position = new PixelPoint(
+            (int)Math.Round(normalizedPlacement.X),
+            (int)Math.Round(normalizedPlacement.Y));
+        _isWindowsManualMaximized = false;
+        _windowsMaximizeMonitorArea = null;
+        UpdateTitleBarMaximizeVisuals();
+        UpdateReadingProgressBarWidth();
+    }
+
+    // Manual maximize leaves the OS window in the Normal state. When the user
+    // drags the title bar, emulate the native "restore under cursor" gesture.
+    private bool RestoreWindowsManualMaximizeForDrag()
+    {
+        var placement = _lastNormalWindowPlacement;
+        var handle = TryGetWindowsHandle();
+        if (placement is null || handle == IntPtr.Zero || !GetCursorPos(out var cursorPoint))
+        {
+            RestoreWindowsManualMaximize();
+            return false;
+        }
+
+        var frameBounds = GetVisibleWindowsFrameBounds(handle);
+        var scaling = _windowsMaximizeMonitorArea?.Scaling ?? GetValidScaling(RenderScaling);
+        var restoreBounds = CalculateWindowsDragRestoreBounds(
+            placement,
+            frameBounds,
+            cursorPoint,
+            scaling,
+            MinWidth,
+            MinHeight);
+
+        _isWindowsManualMaximized = true;
+        var wasNativeMaximized = WindowState == WindowState.Maximized;
+        if (wasNativeMaximized)
+        {
+            try
+            {
+                _isConvertingWindowsNativeMaximize = true;
+                WindowState = WindowState.Normal;
+            }
+            finally
+            {
+                _isConvertingWindowsNativeMaximize = false;
+            }
+        }
+
+        RestoreWindowsNormalChrome(handle);
+        Width = restoreBounds.LogicalWidth;
+        Height = restoreBounds.LogicalHeight;
+
+        if (!SetWindowPos(
+                handle,
+                IntPtr.Zero,
+                restoreBounds.X,
+                restoreBounds.Y,
+                restoreBounds.Width,
+                restoreBounds.Height,
+                WindowsMessages.SwpNoZOrder | WindowsMessages.SwpNoOwnerZOrder | WindowsMessages.SwpFrameChanged))
+        {
+            RestoreWindowsManualMaximize();
+            return false;
+        }
+
+        _isWindowsManualMaximized = false;
+        _windowsMaximizeMonitorArea = null;
+        Position = new PixelPoint(restoreBounds.X, restoreBounds.Y);
+        UpdateTitleBarMaximizeVisuals();
+        UpdateReadingProgressBarWidth();
+        return true;
+    }
+
+    private void ApplyPendingWindowsStartupMaximize()
+    {
+        if (!_pendingWindowsStartupMaximize)
+        {
+            return;
+        }
+
+        _pendingWindowsStartupMaximize = false;
+        var handle = TryGetWindowsHandle();
+        var monitorArea = _windowsMaximizeMonitorArea
+            ?? TryCreateWindowsMonitorAreaFromWindowBounds(handle)
+            ?? TryCreateWindowsMonitorAreaFromHandle(handle);
+
+        if (monitorArea is not null)
+        {
+            TryApplyWindowsManualMaximize(monitorArea.Value);
+        }
+    }
+
+    private void CaptureWindowsNativeMaximizeMonitorArea()
+    {
+        if (!OperatingSystem.IsWindows())
+        {
+            return;
+        }
+
+        var handle = TryGetWindowsHandle();
+        _windowsMaximizeMonitorArea = TryCreateWindowsMonitorAreaFromWindowBounds(handle)
+            ?? TryCreateWindowsMonitorAreaFromCursor()
+            ?? TryCreateWindowsMonitorAreaFromHandle(handle);
+    }
+
+    private void OnWindowAvaloniaPropertyChanged(object? sender, AvaloniaPropertyChangedEventArgs e)
+    {
+        if (e.Property == WindowStateProperty)
+        {
+            UpdateTitleBarMaximizeVisuals();
+        }
+
+        if (e.Property != WindowStateProperty
+            || !OperatingSystem.IsWindows()
+            || _isWindowsManualMaximized
+            || _isConvertingWindowsNativeMaximize
+            || WindowState != WindowState.Maximized)
+        {
+            return;
+        }
+
+        var handle = TryGetWindowsHandle();
+        var monitorArea = _windowsMaximizeMonitorArea
+            ?? TryCreateWindowsMonitorAreaFromWindowBounds(handle)
+            ?? TryCreateWindowsMonitorAreaFromHandle(handle)
+            ?? TryCreateWindowsMonitorAreaFromCursor();
+        if (monitorArea is null || !monitorArea.Value.IsValid)
+        {
+            return;
+        }
+
+        try
+        {
+            _isConvertingWindowsNativeMaximize = true;
+            _isWindowsManualMaximized = true;
+            WindowState = WindowState.Normal;
+            if (!TryApplyWindowsManualMaximize(monitorArea.Value))
+            {
+                _isWindowsManualMaximized = false;
+            }
+        }
+        finally
+        {
+            _isConvertingWindowsNativeMaximize = false;
+        }
+    }
+
+    // Aero Snap can resize the visible DWM frame to the monitor work area before
+    // Avalonia reports a maximized state. Capture that shape so later title-bar
+    // drags restore like a native maximized window.
+    private bool TryCaptureWindowsSnappedMaximize()
+    {
+        if (!OperatingSystem.IsWindows()
+            || _isWindowsManualMaximized
+            || _isConvertingWindowsNativeMaximize
+            || WindowState != WindowState.Normal)
+        {
+            return false;
+        }
+
+        var handle = TryGetWindowsHandle();
+        if (handle == IntPtr.Zero)
+        {
+            return false;
+        }
+
+        var frameBounds = GetVisibleWindowsFrameBounds(handle);
+        var monitorArea = TryFindWindowsMonitorAreaForWorkingBounds(frameBounds);
+        if (monitorArea is null)
+        {
+            return false;
+        }
+
+        return TryApplyWindowsManualMaximize(monitorArea.Value);
+    }
+
+    private WindowsMonitorArea? TryCreateWindowsMonitorAreaFromWindowBounds(IntPtr hWnd)
+    {
+        if (hWnd == IntPtr.Zero || !GetWindowRect(hWnd, out var windowRect))
+        {
+            return null;
+        }
+
+        var windowBounds = windowRect.ToPixelRect();
+        return FindWindowsMonitorAreaForWindowBounds(windowBounds, GetWindowsMonitorAreas());
+    }
+
+    private WindowsMonitorArea? TryFindWindowsMonitorAreaForWorkingBounds(PixelRect bounds)
+        => FindWindowsMonitorAreaForWorkingBounds(
+            bounds,
+            GetWindowsMonitorAreas(),
+            WindowsMessages.SnapBoundsTolerancePixels);
+
+    private WindowsMonitorArea? TryCreateWindowsMonitorAreaFromCursor()
+    {
+        if (!GetCursorPos(out var cursorPoint))
+        {
+            return null;
+        }
+
+        return TryCreateWindowsMonitorAreaFromMonitor(
+            MonitorFromPoint(cursorPoint, WindowsMessages.MonitorDefaultToNearest));
+    }
+
+    private List<WindowsMonitorArea> GetWindowsMonitorAreas()
+    {
+        var monitorAreas = new List<WindowsMonitorArea>();
+        EnumDisplayMonitors(
+            IntPtr.Zero,
+            IntPtr.Zero,
+            (monitor, _, _, _) =>
+            {
+                var monitorArea = TryCreateWindowsMonitorAreaFromMonitor(monitor);
+                if (monitorArea is not null)
+                {
+                    monitorAreas.Add(monitorArea.Value);
+                }
+
+                return true;
+            },
+            IntPtr.Zero);
+
+        return monitorAreas;
+    }
+
+    private WindowsMonitorArea? TryCreateWindowsMonitorAreaFromHandle(IntPtr hWnd)
+    {
+        if (hWnd == IntPtr.Zero)
+        {
+            return null;
+        }
+
+        var monitor = MonitorFromWindow(hWnd, WindowsMessages.MonitorDefaultToNearest);
+        return TryCreateWindowsMonitorAreaFromMonitor(monitor);
+    }
+
+    private WindowsMonitorArea? TryCreateWindowsMonitorAreaFromMonitor(IntPtr monitor)
+    {
+        if (monitor == IntPtr.Zero)
+        {
+            return null;
+        }
+
+        var monitorInfo = new MONITORINFO
+        {
+            cbSize = Marshal.SizeOf<MONITORINFO>()
+        };
+
+        if (!GetMonitorInfo(monitor, ref monitorInfo))
+        {
+            return null;
+        }
+
+        return new WindowsMonitorArea(
+            monitorInfo.rcMonitor.ToPixelRect(),
+            monitorInfo.rcWork.ToPixelRect(),
+            GetValidScaling(RenderScaling));
+    }
+
+    internal static long CalculatePixelRectIntersectionArea(PixelRect first, PixelRect second)
+    {
+        var left = Math.Max(first.X, second.X);
+        var top = Math.Max(first.Y, second.Y);
+        var right = Math.Min(first.X + first.Width, second.X + second.Width);
+        var bottom = Math.Min(first.Y + first.Height, second.Y + second.Height);
+        var width = Math.Max(0, right - left);
+        var height = Math.Max(0, bottom - top);
+
+        return (long)width * height;
+    }
+
+    internal static WindowsMonitorArea? FindWindowsMonitorAreaForWindowBounds(
+        PixelRect windowBounds,
+        IReadOnlyList<WindowsMonitorArea> monitorAreas)
+    {
+        var bestMonitorArea = default(WindowsMonitorArea);
+        var hasBestMonitorArea = false;
+        var bestIntersectionArea = 0L;
+
+        foreach (var monitorArea in monitorAreas)
+        {
+            if (!monitorArea.IsValid)
+            {
+                continue;
+            }
+
+            var intersectionArea = CalculatePixelRectIntersectionArea(windowBounds, monitorArea.MonitorBounds);
+            if (intersectionArea > bestIntersectionArea)
+            {
+                bestMonitorArea = monitorArea;
+                hasBestMonitorArea = true;
+                bestIntersectionArea = intersectionArea;
+            }
+        }
+
+        return hasBestMonitorArea
+            ? bestMonitorArea
+            : null;
+    }
+
+    internal static WindowsMonitorArea? FindWindowsMonitorAreaForWorkingBounds(
+        PixelRect bounds,
+        IReadOnlyList<WindowsMonitorArea> monitorAreas,
+        int tolerancePixels)
+    {
+        foreach (var monitorArea in monitorAreas)
+        {
+            if (monitorArea.IsValid
+                && IsPixelRectCloseTo(bounds, monitorArea.WorkingArea, tolerancePixels))
+            {
+                return monitorArea;
+            }
+        }
+
+        return null;
+    }
+
+    internal static bool IsPixelRectCloseTo(PixelRect actual, PixelRect expected, int tolerancePixels)
+    {
+        var tolerance = Math.Max(0, tolerancePixels);
+        return Math.Abs(actual.X - expected.X) <= tolerance
+            && Math.Abs(actual.Y - expected.Y) <= tolerance
+            && Math.Abs(actual.Width - expected.Width) <= tolerance
+            && Math.Abs(actual.Height - expected.Height) <= tolerance;
+    }
+
+    internal static WindowsDragRestoreBounds CalculateWindowsDragRestoreBounds(
+        WindowPlacement normalPlacement,
+        PixelRect maximizedFrameBounds,
+        POINT cursorPoint,
+        double renderScaling,
+        double minWidth,
+        double minHeight)
+    {
+        var scaling = GetValidScaling(renderScaling);
+        var logicalWidth = Math.Max(minWidth, normalPlacement.Width);
+        var logicalHeight = Math.Max(minHeight, normalPlacement.Height);
+        var width = Math.Max(1, (int)Math.Round(logicalWidth * scaling));
+        var height = Math.Max(1, (int)Math.Round(logicalHeight * scaling));
+        var frameWidth = Math.Max(1, maximizedFrameBounds.Width);
+        var horizontalRatio = Math.Clamp(
+            (cursorPoint.X - maximizedFrameBounds.X) / (double)frameWidth,
+            0,
+            1);
+        var x = cursorPoint.X - (int)Math.Round(width * horizontalRatio);
+        var y = cursorPoint.Y - Math.Min(
+            Math.Max(0, cursorPoint.Y - maximizedFrameBounds.Y),
+            Math.Max(0, height / 3));
+
+        return new WindowsDragRestoreBounds(x, y, width, height, logicalWidth, logicalHeight);
+    }
+
+    private static PixelRect GetVisibleWindowsFrameBounds(IntPtr hWnd)
+    {
+        var result = DwmGetWindowAttribute(
+            hWnd,
+            WindowsMessages.DwmwaExtendedFrameBounds,
+            out var frameBounds,
+            Marshal.SizeOf<RECT>());
+        if (result == 0)
+        {
+            return frameBounds.ToPixelRect();
+        }
+
+        return GetWindowRect(hWnd, out var windowRect)
+            ? windowRect.ToPixelRect()
+            : new PixelRect(0, 0, 1, 1);
+    }
+
+    private static void TrySetWindowsCornerPreference(IntPtr hWnd, int cornerPreference)
+    {
+        if (hWnd == IntPtr.Zero)
+        {
+            return;
+        }
+
+        _ = DwmSetWindowAttribute(
+            hWnd,
+            WindowsMessages.DwmwaWindowCornerPreference,
+            ref cornerPreference,
+            sizeof(int));
+    }
+
+    // A manually maximized Normal window would otherwise keep Windows 11 rounded
+    // corners and a border gap, unlike a real maximized window.
+    private void ApplyWindowsManualMaximizeChrome(IntPtr hWnd)
+    {
+        WindowDecorations = global::Avalonia.Controls.WindowDecorations.None;
+        TrySetWindowsCornerPreference(hWnd, WindowsMessages.DwmwcpDoNotRound);
+        TrySetWindowsBorderColor(hWnd, WindowsMessages.DwmwaColorNone);
+    }
+
+    private void RestoreWindowsNormalChrome(IntPtr hWnd)
+    {
+        WindowDecorations = global::Avalonia.Controls.WindowDecorations.BorderOnly;
+        TrySetWindowsCornerPreference(hWnd, WindowsMessages.DwmwcpDefault);
+        TrySetWindowsBorderColor(hWnd, WindowsMessages.DwmwaColorDefault);
+    }
+
+    private static void TrySetWindowsBorderColor(IntPtr hWnd, int borderColor)
+    {
+        if (hWnd == IntPtr.Zero)
+        {
+            return;
+        }
+
+        _ = DwmSetWindowAttribute(
+            hWnd,
+            WindowsMessages.DwmwaBorderColor,
+            ref borderColor,
+            sizeof(int));
+    }
+
+    private IntPtr TryGetWindowsHandle()
+    {
+        try
+        {
+            var handle = TryGetPlatformHandle();
+            return handle is not null
+                   && string.Equals(handle.HandleDescriptor, "HWND", StringComparison.OrdinalIgnoreCase)
+                ? handle.Handle
+                : IntPtr.Zero;
+        }
+        catch
+        {
+            return IntPtr.Zero;
+        }
+    }
+
+    internal static WindowsMonitorMaximizeBounds CalculateWindowsMonitorMaximizeBounds(
+        PixelRect monitorBounds,
+        PixelRect workingArea,
+        double renderScaling,
+        double minWidth,
+        double minHeight)
+    {
+        var scaling = renderScaling > 0 && !double.IsNaN(renderScaling) && !double.IsInfinity(renderScaling)
+            ? renderScaling
+            : 1;
+
+        return new WindowsMonitorMaximizeBounds(
+            MaxPositionX: Math.Max(0, workingArea.X - monitorBounds.X),
+            MaxPositionY: Math.Max(0, workingArea.Y - monitorBounds.Y),
+            MaxSizeWidth: Math.Max(1, workingArea.Width),
+            MaxSizeHeight: Math.Max(1, workingArea.Height),
+            MinTrackWidth: Math.Max(1, (int)Math.Ceiling(Math.Max(0, minWidth) * scaling)),
+            MinTrackHeight: Math.Max(1, (int)Math.Ceiling(Math.Max(0, minHeight) * scaling)));
+    }
+
+    private static double GetValidScaling(double scaling)
+        => scaling > 0 && !double.IsNaN(scaling) && !double.IsInfinity(scaling)
+            ? scaling
+            : 1;
+
+    internal readonly record struct WindowsMonitorArea(
+        PixelRect MonitorBounds,
+        PixelRect WorkingArea,
+        double Scaling)
+    {
+        public bool IsValid
+            => MonitorBounds.Width > 0
+               && MonitorBounds.Height > 0
+               && WorkingArea.Width > 0
+               && WorkingArea.Height > 0;
+    }
+
+    internal readonly record struct WindowsDragRestoreBounds(
+        int X,
+        int Y,
+        int Width,
+        int Height,
+        double LogicalWidth,
+        double LogicalHeight);
+
+    internal readonly record struct WindowsMonitorMaximizeBounds(
+        int MaxPositionX,
+        int MaxPositionY,
+        int MaxSizeWidth,
+        int MaxSizeHeight,
+        int MinTrackWidth,
+        int MinTrackHeight);
+
     private static bool HasSettingsShortcutModifier(KeyModifiers modifiers)
         => modifiers.HasFlag(KeyModifiers.Control) || modifiers.HasFlag(KeyModifiers.Meta);
 
     private void OnWindowSizeChanged(object? sender, SizeChangedEventArgs e)
     {
+        if (TryCaptureWindowsSnappedMaximize())
+        {
+            UpdateReadingProgressBarWidth();
+            return;
+        }
+
         CaptureLastNormalWindowPlacement();
         UpdateReadingProgressBarWidth();
     }
 
     private void OnWindowPositionChanged(object? sender, PixelPointEventArgs e)
-        => CaptureLastNormalWindowPlacement();
+    {
+        if (TryCaptureWindowsSnappedMaximize())
+        {
+            return;
+        }
+
+        CaptureLastNormalWindowPlacement();
+    }
 
     private void ApplyStartupWindowPlacement()
     {
@@ -407,7 +1099,14 @@ public partial class MainWindow : Window
 
         if (savedPlacement?.IsMaximized == true)
         {
-            WindowState = WindowState.Maximized;
+            if (OperatingSystem.IsWindows())
+            {
+                _pendingWindowsStartupMaximize = true;
+            }
+            else
+            {
+                WindowState = WindowState.Maximized;
+            }
         }
     }
 
@@ -517,13 +1216,20 @@ public partial class MainWindow : Window
 
         if (normalizedPlacement.IsMaximized)
         {
-            WindowState = WindowState.Maximized;
+            if (OperatingSystem.IsWindows())
+            {
+                _pendingWindowsStartupMaximize = true;
+            }
+            else
+            {
+                WindowState = WindowState.Maximized;
+            }
         }
     }
 
     private void CaptureLastNormalWindowPlacement()
     {
-        if (WindowState != WindowState.Normal)
+        if (_isWindowsManualMaximized || WindowState != WindowState.Normal)
         {
             return;
         }
@@ -568,6 +1274,12 @@ public partial class MainWindow : Window
 
     private WindowPlacement? CreateWindowPlacementForPersistence()
     {
+        if (_isWindowsManualMaximized)
+        {
+            var normalPlacement = _lastNormalWindowPlacement ?? CaptureCurrentNormalWindowPlacement();
+            return normalPlacement with { IsMaximized = true };
+        }
+
         if (WindowState == WindowState.Normal)
         {
             return CaptureCurrentNormalWindowPlacement();
@@ -671,5 +1383,119 @@ public partial class MainWindow : Window
     {
         _allowConfirmedClose = true;
         Close();
+    }
+
+    #pragma warning disable SYSLIB1054
+    [DllImport("user32.dll")]
+    private static extern IntPtr MonitorFromWindow(IntPtr hwnd, uint dwFlags);
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr MonitorFromPoint(POINT pt, uint dwFlags);
+
+    [DllImport("user32.dll", EntryPoint = "GetMonitorInfoW")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool GetMonitorInfo(IntPtr hMonitor, ref MONITORINFO lpmi);
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool SetWindowPos(
+        IntPtr hWnd,
+        IntPtr hWndInsertAfter,
+        int x,
+        int y,
+        int cx,
+        int cy,
+        uint uFlags);
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool GetWindowRect(IntPtr hWnd, out RECT lpRect);
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool GetCursorPos(out POINT lpPoint);
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool EnumDisplayMonitors(
+        IntPtr hdc,
+        IntPtr lprcClip,
+        MonitorEnumProc lpfnEnum,
+        IntPtr dwData);
+
+    [DllImport("dwmapi.dll")]
+    private static extern int DwmGetWindowAttribute(
+        IntPtr hwnd,
+        uint dwAttribute,
+        out RECT pvAttribute,
+        int cbAttribute);
+
+    [DllImport("dwmapi.dll")]
+    private static extern int DwmSetWindowAttribute(
+        IntPtr hwnd,
+        uint dwAttribute,
+        ref int pvAttribute,
+        int cbAttribute);
+    #pragma warning restore SYSLIB1054
+
+    private delegate bool MonitorEnumProc(
+        IntPtr hMonitor,
+        IntPtr hdcMonitor,
+        IntPtr lprcMonitor,
+        IntPtr dwData);
+
+    private static class WindowsMessages
+    {
+        public const uint WmGetMinMaxInfo = 0x0024;
+        public const uint MonitorDefaultToNearest = 0x00000002;
+        public const uint SwpNoZOrder = 0x0004;
+        public const uint SwpNoOwnerZOrder = 0x0200;
+        public const uint SwpFrameChanged = 0x0020;
+        public const uint DwmwaExtendedFrameBounds = 9;
+        public const uint DwmwaWindowCornerPreference = 33;
+        public const uint DwmwaBorderColor = 34;
+        public const int DwmwcpDefault = 0;
+        public const int DwmwcpDoNotRound = 1;
+        public const int DwmwaColorDefault = unchecked((int)0xFFFFFFFF);
+        public const int DwmwaColorNone = unchecked((int)0xFFFFFFFE);
+        public const int SnapBoundsTolerancePixels = 8;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct MINMAXINFO
+    {
+        public POINT ptReserved;
+        public POINT ptMaxSize;
+        public POINT ptMaxPosition;
+        public POINT ptMinTrackSize;
+        public POINT ptMaxTrackSize;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    internal struct POINT
+    {
+        public int X;
+        public int Y;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct MONITORINFO
+    {
+        public int cbSize;
+        public RECT rcMonitor;
+        public RECT rcWork;
+        public uint dwFlags;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct RECT
+    {
+        public int Left;
+        public int Top;
+        public int Right;
+        public int Bottom;
+
+        public PixelRect ToPixelRect()
+            => new(Left, Top, Math.Max(0, Right - Left), Math.Max(0, Bottom - Top));
     }
 }

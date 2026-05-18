@@ -109,6 +109,7 @@ public partial class MainWindowViewModel
         nameof(TitleBarClose),
         nameof(TitleBarMaximize),
         nameof(TitleBarMinimize),
+        nameof(TitleBarRestore),
         nameof(UpdatesHint),
         nameof(UpdatesLabel),
         nameof(WelcomeCreateMd),
@@ -180,6 +181,7 @@ public partial class MainWindowViewModel
     public string TitleBarClose => _localization["TitleBarClose"];
     public string TitleBarMaximize => _localization["TitleBarMaximize"];
     public string TitleBarMinimize => _localization["TitleBarMinimize"];
+    public string TitleBarRestore => _localization["TitleBarRestore"];
     public string UpdatesHint => _localization["UpdatesHint"];
     public string UpdatesLabel => _localization["UpdatesLabel"];
     public string WelcomeCreateMd => _localization["WelcomeCreateMd"];
