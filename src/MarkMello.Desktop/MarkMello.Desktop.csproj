@@ -14,6 +14,7 @@
   <PropertyGroup Condition="'$(PublishAot)' == 'true'">
     <InvariantGlobalization>false</InvariantGlobalization>
     <WarningsNotAsErrors>$(WarningsNotAsErrors);IL3053</WarningsNotAsErrors>
+    <CompressSymbols Condition="'$(RuntimeIdentifier)' == 'osx-arm64'">false</CompressSymbols>
   </PropertyGroup>
 
   <ItemGroup>
