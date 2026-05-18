@@ -25,6 +25,10 @@
     <PackageReference Include="Microsoft.Extensions.DependencyInjection" Version="10.0.0" />
   </ItemGroup>
 
+  <ItemGroup Condition="'$(PublishAot)' == 'true' and '$(RuntimeIdentifier)' == 'osx-arm64'">
+    <CustomLinkerArg Include="-ld_classic" />
+  </ItemGroup>
+
   <ItemGroup>
     <ProjectReference Include="..\MarkMello.Application\MarkMello.Application.csproj" />
     <ProjectReference Include="..\MarkMello.Domain\MarkMello.Domain.csproj" />
