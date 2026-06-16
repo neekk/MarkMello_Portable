@@ -220,12 +220,6 @@ public sealed class JsonSettingsStore : ISettingsStore
             return Path.GetFullPath(settingsRootDirectory);
         }
 
-        var appDataDirectory = Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData);
-        if (string.IsNullOrWhiteSpace(appDataDirectory))
-        {
-            return Path.Combine(AppContext.BaseDirectory, "MarkMello");
-        }
-
-        return Path.Combine(appDataDirectory, "MarkMello");
+        return Path.Combine(AppContext.BaseDirectory, "user-settings");
     }
 }
