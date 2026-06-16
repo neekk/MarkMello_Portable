@@ -2,6 +2,10 @@
 
 # MarkMello
 
+> [!NOTE]
+> This is a fork of the original MarkMello project, modified to run in fully portable mode.
+> Preferences are saved locally in the `user-settings` folder instead of `%APPDATA%`.
+
 [Русский](README.md)
 
 **MarkMello is an application for quickly opening and reading Markdown files, with an additional editing mode.**

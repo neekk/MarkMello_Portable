@@ -1,3 +1,4 @@
+// Modified by neekk: Changed settings directory to AppContext.BaseDirectory/user-settings for portable mode.
 using System.Text.Json;
 using MarkMello.Application.Abstractions;
 using MarkMello.Domain;
